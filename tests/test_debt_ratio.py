@@ -19,6 +19,7 @@ def test_increase(
     )
 
     chain.sleep(1)
+    strategy.setDoHealthCheck(False, {"from":gov})
     strategy.harvest({"from": gov})
     chain.sleep(60 * 60 * 24 * 2)
     chain.mine(1)

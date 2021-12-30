@@ -55,29 +55,34 @@ def test_borrow_token_transfer_sends_to_yvault(
 
 
 def test_borrow_token_transfer_increments_profits(
-    vault, test_strategy, token, token_whale, borrow_token, borrow_whale, gov
+    vault, strategy, token, token_whale, borrow_token, borrow_whale, gov, abracadabra
 ):
     token.approve(vault, 2 ** 256 - 1, {"from": token_whale})
     vault.deposit(1000 * (10 ** token.decimals()), {"from": token_whale})
 
     chain.sleep(1)
-    test_strategy.harvest({"from": gov})
+    strategy.harvest({"from": gov})
 
-    amount = 1_000 * (10 ** borrow_token.decimals())
-    borrow_token.transfer(test_strategy, amount, {"from": borrow_whale})
+    amount = 10_000 * (10 ** borrow_token.decimals())
 
     chain.sleep(1)
-    test_strategy.harvest({"from": gov})
+    chain.mine(1)
 
-    token_price = test_strategy._getPrice()
+    borrow_token.transfer(strategy, amount, {"from": borrow_whale})
+
+    chain.sleep(1)
+    chain.mine(1)
+    strategy.harvest({"from": gov})
+
+    token_price = abracadabra.exchangeRate()
     transferInWant = amount / token_price
 
     chain.sleep(60)  # wait a minute!
     chain.mine(1)
 
-    test_strategy.harvest({"from": gov})
+    strategy.harvest({"from": gov})
     # account for fees and slippage - our profit should be at least 95% of the transfer in want
-    assert vault.strategies(test_strategy).dict()["totalGain"] > transferInWant * 0.95
+    assert vault.strategies(strategy).dict()["totalGain"] > transferInWant * 0.95
 
 
 def test_deposit_should_not_increment_profits(vault, strategy, token, token_whale, gov):
