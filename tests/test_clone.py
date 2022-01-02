@@ -5,27 +5,27 @@ from brownie import chain, Wei, reverts, Contract
 
 def test_double_init_should_revert(
     strategy,
-    cloner,
+    factory,
     vault,
     yvault,
     strategist,
     token,
-    gemJoinAdapter,
-    osmProxy,
     price_oracle_eth,
+    abracadabra,
     gov,
+    keeper,
+    rewards
 ):
-    clone_tx = cloner.cloneMakerDaiDelegate(
+    clone_tx = factory.cloneMIMMinter(
         vault,
         strategist,
-        strategist,
-        strategist,
+        rewards,
+        keeper,
         yvault,
-        f"StrategyMaker{token.symbol()}",
-        "0x5946492d41000000000000000000000000000000000000000000000000000000",
-        gemJoinAdapter,
-        osmProxy,
+        "ClonedStrategy",
+        abracadabra,
         price_oracle_eth,
+        {"from": strategist},
     )
 
     cloned_strategy = Contract.from_abi(
@@ -35,25 +35,27 @@ def test_double_init_should_revert(
     with reverts():
         strategy.initialize(
             vault,
+            strategist,
+            rewards,
+            keeper,
             yvault,
-            "NameRevert",
-            "0x5946492d41000000000000000000000000000000000000000000000000000000",
-            gemJoinAdapter,
-            osmProxy,
+            "RevertedStrat",
+            abracadabra,
             price_oracle_eth,
-            {"from": gov},
+            {"from": gov}
         )
 
     with reverts():
         cloned_strategy.initialize(
             vault,
+            strategist,
+            rewards,
+            keeper,
             yvault,
-            "NameRevert",
-            "0x5946492d41000000000000000000000000000000000000000000000000000000",
-            gemJoinAdapter,
-            osmProxy,
+            "ClonedRevertedStrat",
+            abracadabra,
             price_oracle_eth,
-            {"from": gov},
+            {"from": gov}
         )
 
 

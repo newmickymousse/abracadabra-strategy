@@ -1,5 +1,5 @@
 import pytest
-from brownie import config, convert, interface, Contract
+from brownie import config, convert, interface, Contract, ZERO_ADDRESS
 
 
 @pytest.fixture(autouse=True)
@@ -53,6 +53,9 @@ def token_whale(accounts):
         "0xf5bce5077908a1b7370b9ae04adc565ebd643966", force=True
     )  # BentoBox yvWETH
 
+@pytest.fixture
+def health_check():
+    yield Contract("0xddcea799ff1699e98edf118e0629a974df7df012")
 
 @pytest.fixture
 def weth_whale(accounts):
@@ -181,6 +184,18 @@ def abracadabra():
 def healthCheck():
     yield Contract("0xDDCea799fF1699e98EDF118e0629A974Df7DF012")
 
+@pytest.fixture
+def factory(strategist, vault, MIMMinterFactory, new_mim_yvault, abracadabra, price_oracle_eth):
+    factory = strategist.deploy(
+        MIMMinterFactory,
+        vault,
+        new_mim_yvault,
+        "yvweth-MIM-Minter",
+        abracadabra,
+        price_oracle_eth
+    )
+
+    yield factory
 
 @pytest.fixture
 def test_strategy(
@@ -213,27 +228,23 @@ def test_strategy(
 
 
 @pytest.fixture
-def strategy(strategist, vault, Strategy, gov, new_mim_yvault, abracadabra, price_oracle_eth):
-    strategy = strategist.deploy(
-        Strategy,
-        vault,
-        new_mim_yvault,
-        "yvWETH-MIM",
-        abracadabra,
-        price_oracle_eth)
+def strategy(strategist, vault, Strategy, gov, new_mim_yvault, abracadabra, price_oracle_eth, factory, keeper):
 
+    strategy = Contract.from_abi("Strategy", factory.original(), Strategy.abi)
 
-    # strategy = Strategy.at(cloner.original())
-    # strategy.setLeaveDebtBehind(False, {"from": gov})
-    strategy.setDoHealthCheck(True, {"from": gov})
+    strategy.setKeeper(keeper, {"from": gov})
 
-    # set a high acceptable max base fee to avoid changing test behavior
-    # strategy.setMaxAcceptableBaseFee(1500 * 1e9, {"from": gov})
+    for i in range(0, 20):
+        strat_address = vault.withdrawalQueue(i)
+        if ZERO_ADDRESS == strat_address:
+            break
 
-    vault.addStrategy(strategy, 10_000, 0, 2 ** 256 - 1, 1_000, {"from": gov})
+        vault.updateStrategyDebtRatio(strat_address, 0, {"from": gov})
+
+    vault.addStrategy(strategy, 10_000, 0, 2 ** 256 - 1, 0, {"from": gov})
 
     yield strategy
 
 @pytest.fixture(scope="session")
 def RELATIVE_APPROX():
-    yield 1e18 #1 whole unit in tokens with 18 decimals
+    yield 1e-3 #1 whole unit in tokens with 18 decimals

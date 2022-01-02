@@ -17,14 +17,11 @@ def test_operation(chain, token, vault, strategy, user, amount, gov, RELATIVE_AP
 
     # tend()
     strategy.tend({"from": gov})
-
     # withdrawal
     vault.withdraw(vault.balanceOf(user), user, 10, {"from": user})#0.1% loss
 
-    assert (
-        pytest.approx(token.balanceOf(user), rel=RELATIVE_APPROX) == user_balance_before
-    )
-
+    assert token.balanceOf(user) < user_balance_before
+    assert token.balanceOf(user) > user_balance_before * 0.99
 
 def test_emergency_exit(
     chain, token, vault, strategy, user, amount, gov, RELATIVE_APPROX
