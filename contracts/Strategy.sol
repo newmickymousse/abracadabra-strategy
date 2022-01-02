@@ -336,7 +336,7 @@ contract Strategy is BaseStrategy {
     }
 
     // Move yvMIM funds to a new yVault
-    /* function migrateToNewMIMYVault(IVault newYVault) external onlyGovernance {
+    function migrateToNewMIMYVault(IVault newYVault) external onlyGovernance {
         uint256 balanceOfYVault = yVault.balanceOf(address(this));
         if (balanceOfYVault > 0) {
             yVault.withdraw(balanceOfYVault, address(this), maxLoss);
@@ -345,7 +345,7 @@ contract Strategy is BaseStrategy {
 
         yVault = newYVault;
         _depositInvestmentTokenInYVault();
-    } */
+    }
 
     // Allow external debt repayment
     // Allow repayment of an arbitrary amount of MIM in case of an emergency
@@ -373,14 +373,14 @@ contract Strategy is BaseStrategy {
     }
 
     function delegatedAssets() external view override returns (uint256) {
-        return _convertInvestmentTokenToWant(_valueOfInvestment().add(balanceOfInvestmentTokenInBentoBox(false)).add(
+        return _convertInvestmentTokenToWant(_valueOfInvestment().add(balanceOfInvestmentTokenInBentoBox()).add(
             balanceOfInvestmentToken()));
     }
 
     function estimatedTotalAssets() public view override returns (uint256) {
         uint256 remainingInvestmentToken =
             _valueOfInvestment()
-                .add(balanceOfInvestmentTokenInBentoBox(false))
+                .add(balanceOfInvestmentTokenInBentoBox())
                 .add(balanceOfInvestmentToken())
                 .add(balanceOfCollateralInMIM())
                 .sub(balanceOfDebt());
@@ -459,8 +459,6 @@ contract Strategy is BaseStrategy {
         _depositInvestmentTokenInYVault();
     }
 
-    event repay(uint amountToFree, uint maxWithdrawal, uint ratio , uint totalInvestmentAvailableToRepay);
-
     function liquidatePosition(uint256 _amountNeeded)
         internal
         override
@@ -494,7 +492,7 @@ contract Strategy is BaseStrategy {
 
         // Unlock as much collateral as possible while keeping the target ratio
         amountToFree = Math.min(amountToFree, _maxWithdrawal());
-        repay(amountToFree, _maxWithdrawal(), newRatio , 0);
+
         _freeCollateralAndRepayMIM(amountToFree, 0);
 
         // If we still need more want to repay, we may need to unlock some collateral to sell
@@ -570,7 +568,7 @@ contract Strategy is BaseStrategy {
         if (_balanceOfMIM > 0) {
             investmentToken.safeTransfer(_newStrategy, _balanceOfMIM);
         }
-        if (balanceOfInvestmentTokenInBentoBox(false) > 0 || balanceOfWantInBentoBox() > 0) {
+        if (balanceOfInvestmentTokenInBentoBox() > 0 || balanceOfWantInBentoBox() > 0) {
             transferAllBentoBalance(_newStrategy);
         }
 
@@ -607,7 +605,7 @@ contract Strategy is BaseStrategy {
         //TODO: check if this formula is working properly
         return _amtInWei.mul(EXCHANGE_RATE_PRECISION).div(price).mul(wantAsVault.pricePerShare());
     }
-    /* event repay(uint amounttorepay, uint debt, uint ratio , uint totalInvestmentAvailableToRepay); */
+
     // ----------------- PRIVATE FUNCTIONS SUPPORT -----------------
     function _repayDebt(uint256 currentRatio) private {
         //need to compute pending interest
@@ -638,7 +636,7 @@ contract Strategy is BaseStrategy {
         // If we sold want to repay debt we will have MIM readily available in the strategy
         // This means we need to count both yvMIM shares, current MIM balance and MIM in bentobox
         uint256 totalInvestmentAvailableToRepay =
-            _valueOfInvestment().add(balanceOfInvestmentToken()).add(balanceOfInvestmentTokenInBentoBox(false));
+            _valueOfInvestment().add(balanceOfInvestmentToken()).add(balanceOfInvestmentTokenInBentoBox());
 
 
         amountToRepay = Math.min(totalInvestmentAvailableToRepay, amountToRepay);
@@ -718,9 +716,7 @@ contract Strategy is BaseStrategy {
         if (amount == 0) {
             return;
         }
-        /* emit repay(amount, balanceOfDebt(), balanceOfInvestmentToken(), 0); */
         // We cannot pay more than we owe
-        // we need to add 1 because of rounding errors in bentobox
         amount = Math.min(amount, balanceOfDebt());
 
         // We cannot pay more than loose balance
@@ -826,8 +822,8 @@ contract Strategy is BaseStrategy {
         return investmentToken.balanceOf(address(this));
     }
 
-    function balanceOfInvestmentTokenInBentoBox(bool roundup) internal view returns (uint256) {
-        return bentoBox.toAmount(investmentToken, bentoBox.balanceOf(investmentToken, address(this)), roundup);
+    function balanceOfInvestmentTokenInBentoBox() internal view returns (uint256) {
+        return bentoBox.toAmount(investmentToken, bentoBox.balanceOf(investmentToken, address(this)), false);
     }
 
     function balanceOfWantInBentoBox() internal view returns (uint256) {
@@ -906,7 +902,7 @@ contract Strategy is BaseStrategy {
 
         if(mimToRepay > 0) {
 
-            uint256 ITinBentoBox = balanceOfInvestmentTokenInBentoBox(false);
+            uint256 ITinBentoBox = balanceOfInvestmentTokenInBentoBox();
             uint256 _amountToDepositInBB = mimToRepay > ITinBentoBox? mimToRepay.sub(ITinBentoBox):0;
 
             _amountToDepositInBB = Math.min(_amountToDepositInBB, balanceOfInvestmentToken());
@@ -929,7 +925,7 @@ contract Strategy is BaseStrategy {
             uint256 part =
                 RebaseLibrary.toBase(
                     _totalBorrow,
-                    Math.min(mimToRepay, balanceOfInvestmentTokenInBentoBox(false)),
+                    Math.min(mimToRepay, balanceOfInvestmentTokenInBentoBox()),
                     true
                 );
 
@@ -1082,7 +1078,7 @@ contract Strategy is BaseStrategy {
             investmentToken,
             address(this),
             address(this),
-            balanceOfInvestmentTokenInBentoBox(false),
+            balanceOfInvestmentTokenInBentoBox(),
             0
         );
     }
@@ -1102,7 +1098,7 @@ contract Strategy is BaseStrategy {
             investmentToken,
             address(this),
             newDestination,
-            balanceOfInvestmentTokenInBentoBox(false)
+            balanceOfInvestmentTokenInBentoBox()
         );
         bentoBox.transfer(
             want,
