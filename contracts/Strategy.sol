@@ -127,7 +127,7 @@ contract Strategy is BaseStrategy {
         IERC20(0x99D8a9C45b2ecA8864373A26D1459e3Dff1e17F3);
 
     // 100%
-    uint256 internal constant MAX_BPS = 100;
+    uint256 internal constant MAX_BPS = 10000;
 
     // Maximum loss on withdrawal from yVault
     uint256 internal constant MAX_LOSS_BPS = 10000;
@@ -366,15 +366,14 @@ contract Strategy is BaseStrategy {
     }
 
 
-    // ******** OVERRIDDEN METHODS FROM BASE CONTRACT ************
+    // ******** OVERRIDEN METHODS FROM BASE CONTRACT ************
 
     function name() external view override returns (string memory) {
         return strategyName;
     }
 
     function delegatedAssets() external view override returns (uint256) {
-        return _convertInvestmentTokenToWant(_valueOfInvestment().add(balanceOfInvestmentTokenInBentoBox()).add(
-            balanceOfInvestmentToken()));
+        return _convertInvestmentTokenToWant(_valueOfInvestment());
     }
 
     function estimatedTotalAssets() public view override returns (uint256) {
@@ -584,10 +583,6 @@ contract Strategy is BaseStrategy {
         override
         returns (address[] memory ret)
     {
-        ret = new address[](3);
-        ret[0] = yVault.token();
-        ret[1] = wantAsVault.token();
-        ret[2] = address(yVault);
     }
 
     function ethToWant(uint256 _amtInWei)
@@ -603,7 +598,7 @@ contract Strategy is BaseStrategy {
 
         uint256 price = uint256(chainlinkWantUnderlyingTokenToETHPriceFeed.latestAnswer());
         //TODO: check if this formula is working properly
-        return _amtInWei.mul(EXCHANGE_RATE_PRECISION).div(price).mul(wantAsVault.pricePerShare());
+        return _amtInWei.mul(EXCHANGE_RATE_PRECISION).mul(wantAsVault.pricePerShare()).div(price);
     }
 
     // ----------------- PRIVATE FUNCTIONS SUPPORT -----------------
@@ -707,7 +702,11 @@ contract Strategy is BaseStrategy {
     function _depositInvestmentTokenInYVault() private {
         uint256 balanceIT = balanceOfInvestmentToken();
         if (balanceIT > 0) {
-
+            _checkAllowance(
+                address(yVault),
+                address(investmentToken),
+                balanceIT
+            );
             yVault.deposit();
         }
     }
