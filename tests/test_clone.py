@@ -61,38 +61,35 @@ def test_double_init_should_revert(
 
 def test_clone(
     strategy,
-    cloner,
+    factory,
     vault,
     yvault,
     strategist,
     token,
     token_whale,
-    dai,
-    dai_whale,
-    gemJoinAdapter,
-    osmProxy,
+    mim,
+    mim_whale,
     price_oracle_eth,
+    abracadabra,
     gov,
+    keeper,
+    rewards
 ):
-    clone_tx = cloner.cloneMakerDaiDelegate(
+    clone_tx = factory.cloneMIMMinter(
         vault,
         strategist,
-        strategist,
-        strategist,
+        rewards,
+        keeper,
         yvault,
-        f"StrategyMaker{token.symbol()}",
-        strategy.ilk(),
-        gemJoinAdapter,
-        osmProxy,
+        "ClonedStrategy",
+        abracadabra,
         price_oracle_eth,
+        {"from": strategist},
     )
 
     cloned_strategy = Contract.from_abi(
         "Strategy", clone_tx.events["Cloned"]["clone"], strategy.abi
     )
-
-    # White-list the strategy in the OSM!
-    osmProxy.setAuthorized(cloned_strategy, {"from": gov})
 
     vault.updateStrategyDebtRatio(strategy, 0, {"from": gov})
     vault.addStrategy(cloned_strategy, 10_000, 0, 2 ** 256 - 1, 0, {"from": gov})
@@ -109,47 +106,11 @@ def test_clone(
     chain.mine(1)
 
     # Send some profit to yvDAI
-    dai.transfer(yvault, Wei("100_000 ether"), {"from": dai_whale})
+    mim.transfer(yvault, Wei("100_000 ether"), {"from": mim_whale})
 
     chain.sleep(1)
+    cloned_strategy.setDoHealthCheck(False, {"from": gov})
     cloned_strategy.harvest({"from": gov})
 
     assert vault.strategies(cloned_strategy).dict()["totalGain"] > 0
     assert vault.strategies(cloned_strategy).dict()["totalLoss"] == 0
-
-
-def test_clone_of_clone(strategy, cloner, yvault, strategist, token, osmProxy):
-    # Do not have OSM proxy for UNI - passing YFI's to test
-    gemJoinUNI = Contract("0x3BC3A58b4FC1CbE7e98bB4aB7c99535e8bA9b8F1")
-    token = Contract("0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984")
-    yVaultUNI = Contract("0xFBEB78a723b8087fD2ea7Ef1afEc93d35E8Bed42")
-    chainlinkUNIToETH = Contract("0xD6aA3D25116d8dA79Ea0246c4826EB951872e02e")
-    sushiswap = Contract("0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F")
-
-    clone_tx = cloner.cloneMakerDaiDelegate(
-        yVaultUNI,
-        strategist,
-        strategist,
-        strategist,
-        yvault,
-        f"StrategyMaker{token.symbol()}",
-        "0x554e492d41000000000000000000000000000000000000000000000000000000",
-        gemJoinUNI,
-        osmProxy,
-        chainlinkUNIToETH,
-    )
-
-    cloned_strategy = Contract.from_abi(
-        "Strategy", clone_tx.events["Cloned"]["clone"], strategy.abi
-    )
-
-    assert cloned_strategy.router() == sushiswap
-    assert cloned_strategy.yVault() == yvault
-    assert cloned_strategy.name() == "StrategyMakerUNI"
-    assert (
-        cloned_strategy.ilk()
-        == "0x554e492d41000000000000000000000000000000000000000000000000000000"
-    )
-    assert cloned_strategy.wantToUSDOSMProxy() == osmProxy
-    assert cloned_strategy.chainlinkWantToETHPriceFeed() == chainlinkUNIToETH
-    assert cloned_strategy.gemJoinAdapter() == gemJoinUNI

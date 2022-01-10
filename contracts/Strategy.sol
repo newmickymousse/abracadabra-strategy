@@ -268,7 +268,7 @@ contract Strategy is BaseStrategy {
 
         // Current ratio can drift (collateralizationRatio - rebalanceTolerance, collateralizationRatio + rebalanceTolerance)
         // Allow additional 10 bps in any direction (153, 173) by default
-        rebalanceTolerance = 10;
+        rebalanceTolerance = 1000;
 
         // Use 30 bps more than the max collateral ratio as target. In case the max is 75%, which is 133 collateral ratio,
         // we will move between 153 and 173, with a target of 163, which is 61%.
@@ -623,10 +623,10 @@ contract Strategy is BaseStrategy {
         // amountToRepay = (current_debt - new_debt)
         // amountToRepay = (current_debt - (current_debt * current_ratio / desired_ratio))
         // amountToRepay = current_debt * (1 - (current_ratio / desired_ratio))
-        /* uint256 newDebt =
-            currentDebt.mul(currentRatio).div(collateralizationRatio); */
+        uint256 newDebt =
+            currentDebt.mul(currentRatio).div(collateralizationRatio);
 
-        uint256 amountToRepay = currentDebt.mul(MAX_BPS.sub(currentRatio.div(collateralizationRatio))).div(MAX_BPS);
+        uint256 amountToRepay = currentDebt.sub(newDebt);
 
         // If we sold want to repay debt we will have MIM readily available in the strategy
         // This means we need to count both yvMIM shares, current MIM balance and MIM in bentobox
@@ -854,7 +854,7 @@ contract Strategy is BaseStrategy {
 
     // Effective collateralization ratio of the strat
     function getCurrentCollateralRatio() public view returns (uint256 _collateralRate) {
-        if (balanceOfDebt() == 0) return C_RATE_PRECISION.div(MAX_BPS);//dev: this should represent infinity in this case
+        if (balanceOfDebt() == 0) return maxCollaterizationRate.add(rebalanceTolerance*5);//dev: this should represent infinity in this case
         _collateralRate = balanceOfCollateralInMIM().mul(MAX_BPS).div(
             balanceOfDebt()
         );

@@ -18,19 +18,30 @@ def test_direct_transfer_increments_profits(
     initialProfit = vault.strategies(strategy).dict()["totalGain"]
     assert initialProfit == 0
 
+
     token.approve(vault.address, 2 ** 256 - 1, {"from": token_whale})
     vault.deposit(1000 * (10 ** token.decimals()), {"from": token_whale})
     chain.sleep(1)
+    chain.mine(1)
     strategy.harvest({"from": gov})
+    collateralBefore = strategy.balanceOfCollateral()
 
     amount = 5 * (10 ** token.decimals())
     token.transfer(strategy, amount, {"from": token_whale})
 
     chain.sleep(1)
+    chain.mine(1)
     strategy.harvest({"from": gov})
+    collateralAfter = strategy.balanceOfCollateral()
+
+    assert vault.strategies(strategy).dict()["totalGain"] > 0
+    assert vault.strategies(strategy).dict()["totalGain"] <= (initialProfit + amount)
+
+    # added the collateral here because given the bounds that the strategy can move,
+    # some collateral can be locked and not reported as profit
     assert (
         pytest.approx(
-            vault.strategies(strategy).dict()["totalGain"] / token.decimals(),
+            (vault.strategies(strategy).dict()["totalGain"] + (collateralAfter-collateralBefore)) / token.decimals(),
             rel=RELATIVE_APPROX,
         )
         == (initialProfit + amount) / token.decimals()

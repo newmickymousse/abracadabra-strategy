@@ -1,6 +1,7 @@
 import pytest
 from brownie import chain, reverts, Wei
 
+DUST_THRESHOLD = 10_000
 
 def test_passing_zero_should_repay_all_debt(
     vault, strategy, token, token_whale, user, gov, mim, mim_whale, yvMIM, RELATIVE_APPROX
@@ -31,7 +32,7 @@ def test_passing_zero_should_repay_all_debt(
     # assert False
 
     # All debt is repaid and collateral is left untouched
-    assert strategy.balanceOfDebt() < RELATIVE_APPROX
+    assert strategy.balanceOfDebt() < DUST_THRESHOLD
     assert strategy.balanceOfCollateral() == prev_collat
 
 
@@ -72,10 +73,15 @@ def test_from_ratio_adjusts_debt(
     prev_debt = strategy.balanceOfDebt()
     prev_collat = strategy.balanceOfCollateral()
     c_ratio = strategy.collateralizationRatio()
+    prev_collat_ratio = strategy.getCurrentCollateralRatio()
     strategy.emergencyDebtRepayment(0, c_ratio * 0.7, {"from": vault.management()})
 
     # Debt is partially repaid and collateral is left untouched
+    assert strategy.balanceOfDebt() < prev_debt
+    assert strategy.balanceOfCollateral() == prev_collat
+    assert strategy.balanceOfDebt() > DUST_THRESHOLD
+    assert strategy.getCurrentCollateralRatio() > prev_collat_ratio
+
     assert (
         pytest.approx(strategy.balanceOfDebt(), rel=RELATIVE_APPROX) == prev_debt * 0.7
     )
-    assert strategy.balanceOfCollateral() == prev_collat
