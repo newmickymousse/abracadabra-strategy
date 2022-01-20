@@ -194,7 +194,7 @@ contract Strategy is BaseStrategy {
     // Abracadabra max collaterization ratio
     uint256 private maxCollaterizationRate;
 
-    // MIM sell buffer after profits. Default to 1%.
+    // MIM sell buffer after profits and slippage out for the exchange from 3crv to MIM and vice versa. Default to 1%.
     uint256 private sellBuffer = 100;
 
     // ----------------- INIT FUNCTIONS TO SUPPORT CLONING -----------------
@@ -299,6 +299,7 @@ contract Strategy is BaseStrategy {
         /* investmentToken.safeApprove(address(crvMIM), type(uint256).max); */
         investmentToken.safeApprove(address(yVault), type(uint256).max);
         IERC20(wantAsVault.token()).safeApprove(address(want), type(uint256).max);
+        IERC20(wantAsVault).safeApprove(address(wantAsVault), type(uint256).max);
         require(address(want) == abracadabra.collateral());
     }
 
@@ -316,12 +317,10 @@ contract Strategy is BaseStrategy {
 
             maxAcceptableBaseFee = _maxAcceptableBaseFee;
             require(
-                _collateralizationRatio.sub(rebalanceTolerance) > maxCollaterizationRate
-            ); // dev: desired collateralization ratio is too low
+                _collateralizationRatio.sub(_rebalanceTolerance) > maxCollaterizationRate
+            ); // dev: desired collateralization ratio is too low or desired rebalance tolerance makes allowed ratio too low
 
             collateralizationRatio = _collateralizationRatio;
-            require(collateralizationRatio.sub(_rebalanceTolerance) > maxCollaterizationRate); // dev: desired rebalance tolerance makes allowed ratio too low
-
             rebalanceTolerance = _rebalanceTolerance;
 
             leaveDebtBehind = _leaveDebtBehind;
@@ -336,7 +335,7 @@ contract Strategy is BaseStrategy {
     }
 
     // Move yvMIM funds to a new yVault
-    function migrateToNewMIMYVault(IVault newYVault) external onlyGovernance {
+    /* function migrateToNewMIMYVault(IVault newYVault) external onlyGovernance {
         uint256 balanceOfYVault = yVault.balanceOf(address(this));
         if (balanceOfYVault > 0) {
             yVault.withdraw(balanceOfYVault, address(this), maxLoss);
@@ -345,7 +344,7 @@ contract Strategy is BaseStrategy {
 
         yVault = newYVault;
         _depositInvestmentTokenInYVault();
-    }
+    } */
 
     // Allow external debt repayment
     // Allow repayment of an arbitrary amount of MIM in case of an emergency
@@ -358,6 +357,8 @@ contract Strategy is BaseStrategy {
         external
         onlyVaultManagers
     {
+        // compute new debt
+        abracadabra.accrue();
         if (amount > 0) {
             _repayInvestmentTokenDebt(amount);
         } else {
@@ -379,12 +380,14 @@ contract Strategy is BaseStrategy {
     function estimatedTotalAssets() public view override returns (uint256) {
         uint256 remainingInvestmentToken =
             _valueOfInvestment()
-                .add(balanceOfInvestmentTokenInBentoBox())
+                .add(balanceOfInvestmentTokenInBentoBox(false))
                 .add(balanceOfInvestmentToken())
-                .add(balanceOfCollateralInMIM())
+                .add(balanceOfCollateralInMIM(false))
                 .sub(balanceOfDebt());
 
-        return balanceOfWant().add(balanceOfWantInBentoBox()).add(_convertInvestmentTokenToWant(remainingInvestmentToken));
+        return balanceOfWant()
+            .add(balanceOfWantInBentoBox())
+            .add(_convertInvestmentTokenToWant(remainingInvestmentToken));
     }
 
     function prepareReturn(uint256 _debtOutstanding)
@@ -400,6 +403,9 @@ contract Strategy is BaseStrategy {
 
         // Claim rewards from yVault
         _takeYVaultProfit();
+
+        // compute new debt so the collateral ratio is updated
+        abracadabra.accrue();
 
         uint256 totalAssetsAfterProfit = estimatedTotalAssets();
 
@@ -474,7 +480,7 @@ contract Strategy is BaseStrategy {
         uint256 amountToFree = _amountNeeded.sub(balance);
 
         // We cannot free more than what we have locked
-        amountToFree = Math.min(amountToFree, balanceOfCollateral());
+        amountToFree = Math.min(amountToFree, balanceOfCollateral(false));
 
         uint256 totalDebt = balanceOfDebt();
 
@@ -484,7 +490,7 @@ contract Strategy is BaseStrategy {
         }
 
         uint256 newRatio =
-            balanceOfCollateralInMIM().sub(_convertWantToInvestmentToken(amountToFree)).mul(MAX_BPS).div(totalDebt);
+            balanceOfCollateralInMIM(true).sub(_convertWantToInvestmentToken(amountToFree)).mul(MAX_BPS).div(totalDebt);
 
         // Attempt to repay necessary debt to restore the target collateralization ratio
         _repayDebt(newRatio);
@@ -537,7 +543,7 @@ contract Strategy is BaseStrategy {
         returns (bool)
     {
         // Nothing to adjust if there is no collateral locked
-        if (balanceOfCollateral() == 0) {
+        if (balanceOfCollateral(false) == 0) {
             return false;
         }
 
@@ -554,20 +560,28 @@ contract Strategy is BaseStrategy {
             currentRatio > collateralizationRatio.add(rebalanceTolerance) &&
             balanceOfDebt() > 0 &&
             isCurrentBaseFeeAcceptable() &&
-            balanceOfAvailableMIMinAbra() > 0;
+            balanceOfAvailableMIMinAbra() > balanceOfCollateralInMIM(false).mul(100).div(MAX_BPS); //10% of the collateral as MIM in Abra
     }
 
-    //TODO: fix, not working properly
     function prepareMigration(address _newStrategy) internal override {
         // Move yvMIM balance to the new strategy
+        abracadabra.accrue();
         _repayDebt(0);
-        _freeCollateralAndRepayMIM(balanceOfCollateral(), 0);
+        uint256 collateralToFree = Math.min(balanceOfCollateral(true), _maxWithdrawal());
+        _freeCollateralAndRepayMIM(collateralToFree, 0);
+        if (
+            !leaveDebtBehind &&
+            balanceOfDebt() > 0
+        ) {
+            _sellCollateralToRepayRemainingDebtIfNeeded();
+        }
 
         uint256 _balanceOfMIM = balanceOfInvestmentToken();
+
         if (_balanceOfMIM > 0) {
             investmentToken.safeTransfer(_newStrategy, _balanceOfMIM);
         }
-        if (balanceOfInvestmentTokenInBentoBox() > 0 || balanceOfWantInBentoBox() > 0) {
+        if (balanceOfInvestmentTokenInBentoBox(false) > 0 || balanceOfWantInBentoBox() > 0) {
             transferAllBentoBalance(_newStrategy);
         }
 
@@ -603,8 +617,6 @@ contract Strategy is BaseStrategy {
 
     // ----------------- PRIVATE FUNCTIONS SUPPORT -----------------
     function _repayDebt(uint256 currentRatio) private {
-        //need to compute pending interest
-        abracadabra.accrue();
         uint256 currentDebt = balanceOfDebt();
 
         // Nothing to repay if we are over the collateralization ratio
@@ -621,27 +633,22 @@ contract Strategy is BaseStrategy {
         // new_debt = current_debt * current_ratio / desired_ratio
         // and the amount to repay is the difference between current_debt and new_debt
         // amountToRepay = (current_debt - new_debt)
-        // amountToRepay = (current_debt - (current_debt * current_ratio / desired_ratio))
-        // amountToRepay = current_debt * (1 - (current_ratio / desired_ratio))
         uint256 newDebt =
             currentDebt.mul(currentRatio).div(collateralizationRatio);
 
         uint256 amountToRepay = currentDebt.sub(newDebt);
 
+        uint256 balanceIT = balanceOfInvestmentToken();
         // If we sold want to repay debt we will have MIM readily available in the strategy
-        // This means we need to count both yvMIM shares, current MIM balance and MIM in bentobox
+        // This means we need to count yvMIM shares, current MIM balance and MIM in bentobox
         uint256 totalInvestmentAvailableToRepay =
-            _valueOfInvestment().add(balanceOfInvestmentToken()).add(balanceOfInvestmentTokenInBentoBox());
-
+            _valueOfInvestment().add(balanceIT).add(balanceOfInvestmentTokenInBentoBox(false));
 
         amountToRepay = Math.min(totalInvestmentAvailableToRepay, amountToRepay);
-
-        uint256 balanceIT = balanceOfInvestmentToken();
 
         if (amountToRepay > balanceIT) {
             _withdrawFromYVault(amountToRepay.sub(balanceIT));
         }
-
 
         _repayInvestmentTokenDebt(amountToRepay);
     }
@@ -653,17 +660,18 @@ contract Strategy is BaseStrategy {
         uint256 investmentLeftToAcquireInWant =
             _convertInvestmentTokenToWant(investmentLeftToAcquire);
 
+
         if (investmentLeftToAcquireInWant <= balanceOfWant()) {
             _buyInvestmentTokenWithWant(investmentLeftToAcquire);
             _repayDebt(0);
-            _freeCollateralAndRepayMIM(balanceOfCollateral(), 0);
+            _freeCollateralAndRepayMIM(balanceOfCollateral(true), 0);
         }
     }
 
     // Mint the maximum MIM possible for the locked collateral
     function _mintMoreInvestmentToken() private {
         uint256 _amountToBorrow =
-            balanceOfCollateralInMIM().mul(MAX_BPS).div(collateralizationRatio).sub(balanceOfDebt());
+            balanceOfCollateralInMIM(false).mul(MAX_BPS).div(collateralizationRatio).sub(balanceOfDebt());
 
         // won't be able to borrow more than available supply
         _amountToBorrow = Math.min(
@@ -783,7 +791,7 @@ contract Strategy is BaseStrategy {
     // Returns maximum collateral to withdraw while maintaining the target collateralization ratio
     function _maxWithdrawal() private view returns (uint256) {
         // Denominated in want
-        uint256 totalCollateral = balanceOfCollateralInMIM();
+        uint256 totalCollateral = balanceOfCollateralInMIM(false);
 
         // Denominated in investment token
         uint256 totalDebt = balanceOfDebt();
@@ -821,8 +829,8 @@ contract Strategy is BaseStrategy {
         return investmentToken.balanceOf(address(this));
     }
 
-    function balanceOfInvestmentTokenInBentoBox() internal view returns (uint256) {
-        return bentoBox.toAmount(investmentToken, bentoBox.balanceOf(investmentToken, address(this)), false);
+    function balanceOfInvestmentTokenInBentoBox(bool roundUp) internal view returns (uint256) {
+        return bentoBox.toAmount(investmentToken, bentoBox.balanceOf(investmentToken, address(this)), roundUp);
     }
 
     function balanceOfWantInBentoBox() internal view returns (uint256) {
@@ -831,21 +839,21 @@ contract Strategy is BaseStrategy {
 
     function balanceOfDebt() public view returns (uint256 _borrowedAmount) {
         Rebase memory _totalBorrow = abracadabra.totalBorrow();
-        _borrowedAmount = RebaseLibrary.toElastic(_totalBorrow, abracadabra.userBorrowPart(address(this)), false);
+        _borrowedAmount = RebaseLibrary.toElastic(_totalBorrow, abracadabra.userBorrowPart(address(this)), true);
     }
 
     // Returns collateral balance in the abracadabra in Want
-    function balanceOfCollateral() public view returns (uint256 _collateralAmount) {
+    function balanceOfCollateral(bool roundUp) public view returns (uint256 _collateralAmount) {
         _collateralAmount = bentoBox.toAmount(
             want,
             abracadabra.userCollateralShare(address(this)),
-            false
+            roundUp
         );
     }
 
     // Returns collateral balance in the abracadabra in MIM
-    function balanceOfCollateralInMIM() private view returns (uint256 _collateralAmount) {
-        _collateralAmount = _convertWantToInvestmentToken(balanceOfCollateral());
+    function balanceOfCollateralInMIM(bool roundUp) public view returns (uint256 _collateralAmount) {
+        _collateralAmount = _convertWantToInvestmentToken(balanceOfCollateral(roundUp));
     }
 
     function balanceOfAvailableMIMinAbra() internal view returns (uint256 _availableMIM) {
@@ -854,8 +862,9 @@ contract Strategy is BaseStrategy {
 
     // Effective collateralization ratio of the strat
     function getCurrentCollateralRatio() public view returns (uint256 _collateralRate) {
+        if(balanceOfCollateral(false) == 0) return 0;// TODO: remove this line
         if (balanceOfDebt() == 0) return maxCollaterizationRate.add(rebalanceTolerance*5);//dev: this should represent infinity in this case
-        _collateralRate = balanceOfCollateralInMIM().mul(MAX_BPS).div(
+        _collateralRate = balanceOfCollateralInMIM(false).mul(MAX_BPS).div(
             balanceOfDebt()
         );
     }
@@ -901,7 +910,7 @@ contract Strategy is BaseStrategy {
 
         if(mimToRepay > 0) {
 
-            uint256 ITinBentoBox = balanceOfInvestmentTokenInBentoBox();
+            uint256 ITinBentoBox = balanceOfInvestmentTokenInBentoBox(false);
             uint256 _amountToDepositInBB = mimToRepay > ITinBentoBox? mimToRepay.sub(ITinBentoBox):0;
 
             _amountToDepositInBB = Math.min(_amountToDepositInBB, balanceOfInvestmentToken());
@@ -913,9 +922,6 @@ contract Strategy is BaseStrategy {
                     address(this),
                     _amountToDepositInBB,
                     0
-                    /* bentoBox.toShare(investmentToken,
-                        RebaseLibrary.toElastic(_totalBorrow, _amountToDepositInBB, false),
-                        false) */
                 );
             }
 
@@ -924,8 +930,8 @@ contract Strategy is BaseStrategy {
             uint256 part =
                 RebaseLibrary.toBase(
                     _totalBorrow,
-                    Math.min(mimToRepay, balanceOfInvestmentTokenInBentoBox()),
-                    true
+                    balanceOfInvestmentTokenInBentoBox(false),
+                    false
                 );
 
             // cannot pay more than is owed
@@ -938,14 +944,13 @@ contract Strategy is BaseStrategy {
         }
         // we need to withdraw enough to keep our c-rate
         if (collateralAmount > 0) {
-
+            // we cannot remove more collateral than max withdrawal
             abracadabra.removeCollateral(
                 address(this),
                 bentoBox.toShare(
                     want,
-                    collateralAmount,
-                    false)
-                );
+                    Math.min(collateralAmount, _maxWithdrawal()),
+                    false));
 
             removeCollateralFromBentoBox();
         }
@@ -971,9 +976,9 @@ contract Strategy is BaseStrategy {
         view
         returns (uint256)
     {
-        return amount.div(abracadabra.exchangeRate()).mul(
+        return amount.mul(
                 EXCHANGE_RATE_PRECISION
-            );
+            ).div(abracadabra.exchangeRate());
     }
 
 
@@ -1024,10 +1029,10 @@ contract Strategy is BaseStrategy {
         }
 
         crvMIM.exchange_underlying(
-            tokenA,
-            tokenB,
+            int128(tokenA),
+            int128(tokenB),
             _amount,
-            0
+            _amount.mul(MAX_BPS-sellBuffer).div(MAX_BPS)
         );
 
     }
@@ -1037,8 +1042,12 @@ contract Strategy is BaseStrategy {
             return;
         }
 
+        // cannot withdraw more than we have
+        _amount = Math.min(_convertInvestmentTokenToWant(_amount), balanceOfWant());
+
         //1. unwrap from vault
-        uint256 collateral = wantAsVault.withdraw(_amount);
+        _checkAllowance(address(wantAsVault), address(wantAsVault), _amount);
+        uint256 collateral = wantAsVault.withdraw(_amount, address(this), maxLoss);
 
         //2. underlying token -> dai
         _sellAForB(collateral, wantAsVault.token(), address(dai));
@@ -1077,7 +1086,7 @@ contract Strategy is BaseStrategy {
             investmentToken,
             address(this),
             address(this),
-            balanceOfInvestmentTokenInBentoBox(),
+            balanceOfInvestmentTokenInBentoBox(false),
             0
         );
     }
@@ -1097,7 +1106,7 @@ contract Strategy is BaseStrategy {
             investmentToken,
             address(this),
             newDestination,
-            balanceOfInvestmentTokenInBentoBox()
+            balanceOfInvestmentTokenInBentoBox(false)
         );
         bentoBox.transfer(
             want,

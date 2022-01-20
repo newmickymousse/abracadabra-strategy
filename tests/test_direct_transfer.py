@@ -24,7 +24,7 @@ def test_direct_transfer_increments_profits(
     chain.sleep(1)
     chain.mine(1)
     strategy.harvest({"from": gov})
-    collateralBefore = strategy.balanceOfCollateral()
+    collateralBefore = strategy.balanceOfCollateral(False)
 
     amount = 5 * (10 ** token.decimals())
     token.transfer(strategy, amount, {"from": token_whale})
@@ -32,7 +32,7 @@ def test_direct_transfer_increments_profits(
     chain.sleep(1)
     chain.mine(1)
     strategy.harvest({"from": gov})
-    collateralAfter = strategy.balanceOfCollateral()
+    collateralAfter = strategy.balanceOfCollateral(False)
 
     assert vault.strategies(strategy).dict()["totalGain"] > 0
     assert vault.strategies(strategy).dict()["totalGain"] <= (initialProfit + amount)
