@@ -11,35 +11,137 @@ import {
     Address
 } from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 
-import "./libraries/MakerDaiDelegateLib.sol";
+import "./libraries/Boring/BoringMath.sol";
+import "./libraries/Boring/BoringRebase.sol";
 
 import "../interfaces/chainlink/AggregatorInterface.sol";
 import "../interfaces/swap/ISwap.sol";
+import "../interfaces/swap/ICurveFI.sol";
 import "../interfaces/yearn/IBaseFee.sol";
-import "../interfaces/yearn/IOSMedianizer.sol";
 import "../interfaces/yearn/IVault.sol";
+
+
+interface IBentoBoxV1 {
+    function balanceOf(IERC20, address) external view returns (uint256);
+
+    function transfer(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 share
+    ) external;
+
+    function deposit(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount,
+        uint256 share
+    ) external payable returns (uint256 amountOut, uint256 shareOut);
+
+    function setMasterContractApproval(
+        address user,
+        address masterContract,
+        bool approved,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    function toAmount(
+        IERC20 token,
+        uint256 share,
+        bool roundUp
+    ) external view returns (uint256 amount);
+
+    function toShare(
+        IERC20 token,
+        uint256 amount,
+        bool roundUp
+    ) external view returns (uint256 share);
+
+    function totals(IERC20) external view returns (Rebase memory totals_);
+
+    function withdraw(
+        IERC20 token_,
+        address from,
+        address to,
+        uint256 amount,
+        uint256 share
+    ) external returns (uint256 amountOut, uint256 shareOut);
+}
+
+interface IAbracadabra {
+    function COLLATERIZATION_RATE() external view returns (uint256);
+
+    function bentoBox() external view returns (IBentoBoxV1);
+
+    function masterContract() external view returns (address);
+
+    function addCollateral(
+        address to,
+        bool skim,
+        uint256 share
+    ) external;
+
+    function removeCollateral(address to, uint256 share) external;
+
+    function borrow(address to, uint256 amount)
+        external
+        returns (uint256 part, uint256 share);
+
+    function repay(
+        address to,
+        bool skim,
+        uint256 part
+    ) external returns (uint256 amount);
+
+    function exchangeRate() external view returns (uint256);
+
+    function userBorrowPart(address) external view returns (uint256);
+
+    function userCollateralShare(address) external view returns (uint256);
+
+    function totalBorrow() external view returns (Rebase memory totals);
+
+    function collateral() external view returns (address);
+
+    function accrue() external;
+}
+
 
 contract Strategy is BaseStrategy {
     using SafeERC20 for IERC20;
     using Address for address;
     using SafeMath for uint256;
 
-    // Units used in Maker contracts
-    uint256 internal constant WAD = 10**18;
-    uint256 internal constant RAY = 10**27;
 
-    // DAI token
+    // Collateral Rate Precision
+    uint256 internal constant C_RATE_PRECISION = 1e5;
+
+    // Exchange Rate Precision
+    uint256 internal constant EXCHANGE_RATE_PRECISION = 1e18;
+
+    // MIM token
     IERC20 internal constant investmentToken =
-        IERC20(0x6B175474E89094C44Da98b954EedeAC495271d0F);
+        IERC20(0x99D8a9C45b2ecA8864373A26D1459e3Dff1e17F3);
 
     // 100%
-    uint256 internal constant MAX_BPS = WAD;
+    uint256 internal constant MAX_BPS = 10000;
 
     // Maximum loss on withdrawal from yVault
     uint256 internal constant MAX_LOSS_BPS = 10000;
 
     // Wrapped Ether - Used for swaps routing
     address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+    // DAI - Used for swaps routing
+    IERC20 internal constant dai =
+        IERC20(0x6B175474E89094C44Da98b954EedeAC495271d0F);
+
+    // crvMIM - Used for efficient mim-dai swaps
+    ICurveFI internal constant crvMIM =
+        ICurveFI(0x5a6A4D54456819380173272A5E8E9B9904BdF41B);
 
     // SushiSwap router
     ISwap internal constant sushiswapRouter =
@@ -53,26 +155,17 @@ contract Strategy is BaseStrategy {
     IBaseFee internal constant baseFeeProvider =
         IBaseFee(0xf8d0Ec04e94296773cE20eFbeeA82e76220cD549);
 
-    // Token Adapter Module for collateral
-    address public gemJoinAdapter;
+    // Use Chainlink oracle to obtain latest want_underlying_token/ETH price
+    AggregatorInterface public chainlinkWantUnderlyingTokenToETHPriceFeed;
 
-    // Maker Oracle Security Module
-    IOSMedianizer public wantToUSDOSMProxy;
-
-    // Use Chainlink oracle to obtain latest want/ETH price
-    AggregatorInterface public chainlinkWantToETHPriceFeed;
-
-    // DAI yVault
+    // MIM yVault
     IVault public yVault;
 
+    // Want as vault
+    IVault internal wantAsVault;
+
     // Router used for swaps
-    ISwap public router;
-
-    // Collateral type
-    bytes32 public ilk;
-
-    // Our vault identifier
-    uint256 public cdpId;
+    ISwap internal router;
 
     // Our desired collaterization ratio
     uint256 public collateralizationRatio;
@@ -92,35 +185,44 @@ contract Strategy is BaseStrategy {
     // Name of the strategy
     string internal strategyName;
 
+    // Abracadabra Contract
+    IAbracadabra public abracadabra;
+
+    // BentoBox corresponding to the Abracadabra Contract
+    IBentoBoxV1 private bentoBox;
+
+    // Abracadabra max collaterization ratio
+    uint256 private maxCollaterizationRate;
+
+    // MIM sell buffer after profits and slippage out for the exchange from 3crv to MIM and vice versa. Default to 1%.
+    uint256 private sellBuffer = 100;
+
     // ----------------- INIT FUNCTIONS TO SUPPORT CLONING -----------------
 
     constructor(
         address _vault,
         address _yVault,
         string memory _strategyName,
-        bytes32 _ilk,
-        address _gemJoin,
-        address _wantToUSDOSMProxy,
-        address _chainlinkWantToETHPriceFeed
+        address _abracadabra,
+        address _chainlinkWantUnderlyingTokenToETHPriceFeed
     ) public BaseStrategy(_vault) {
         _initializeThis(
             _yVault,
             _strategyName,
-            _ilk,
-            _gemJoin,
-            _wantToUSDOSMProxy,
-            _chainlinkWantToETHPriceFeed
+            _abracadabra,
+            _chainlinkWantUnderlyingTokenToETHPriceFeed
         );
     }
 
     function initialize(
         address _vault,
+        address _strategist,
+        address _rewards,
+        address _keeper,
         address _yVault,
         string memory _strategyName,
-        bytes32 _ilk,
-        address _gemJoin,
-        address _wantToUSDOSMProxy,
-        address _chainlinkWantToETHPriceFeed
+        address _abracadabra,
+        address _chainlinkWantUnderlyingTokenToETHPriceFeed
     ) public {
         // Make sure we only initialize one time
         require(address(yVault) == address(0)); // dev: strategy already initialized
@@ -128,34 +230,34 @@ contract Strategy is BaseStrategy {
         address sender = msg.sender;
 
         // Initialize BaseStrategy
-        _initialize(_vault, sender, sender, sender);
+        _initialize(_vault, _strategist, _rewards, _keeper);
 
         // Initialize cloned instance
         _initializeThis(
             _yVault,
             _strategyName,
-            _ilk,
-            _gemJoin,
-            _wantToUSDOSMProxy,
-            _chainlinkWantToETHPriceFeed
+            _abracadabra,
+            _chainlinkWantUnderlyingTokenToETHPriceFeed
         );
     }
 
     function _initializeThis(
         address _yVault,
         string memory _strategyName,
-        bytes32 _ilk,
-        address _gemJoin,
-        address _wantToUSDOSMProxy,
-        address _chainlinkWantToETHPriceFeed
+        address _abracadabra,
+        address _chainlinkWantUnderlyingTokenToETHPriceFeed
     ) internal {
         yVault = IVault(_yVault);
         strategyName = _strategyName;
-        ilk = _ilk;
-        gemJoinAdapter = _gemJoin;
-        wantToUSDOSMProxy = IOSMedianizer(_wantToUSDOSMProxy);
-        chainlinkWantToETHPriceFeed = AggregatorInterface(
-            _chainlinkWantToETHPriceFeed
+
+        abracadabra = IAbracadabra(_abracadabra);
+        bentoBox = IBentoBoxV1(abracadabra.bentoBox());
+        maxCollaterizationRate = C_RATE_PRECISION.mul(MAX_BPS).div(abracadabra.COLLATERIZATION_RATE());
+
+        wantAsVault = IVault(address(want));
+
+        chainlinkWantUnderlyingTokenToETHPriceFeed = AggregatorInterface(
+            _chainlinkWantUnderlyingTokenToETHPriceFeed
         );
 
         // Set default router to SushiSwap
@@ -164,18 +266,15 @@ contract Strategy is BaseStrategy {
         // Set health check to health.ychad.eth
         healthCheck = 0xDDCea799fF1699e98EDF118e0629A974Df7DF012;
 
-        cdpId = MakerDaiDelegateLib.openCdp(ilk);
-        require(cdpId > 0); // dev: error opening cdp
-
         // Current ratio can drift (collateralizationRatio - rebalanceTolerance, collateralizationRatio + rebalanceTolerance)
-        // Allow additional 15% in any direction (210, 240) by default
-        rebalanceTolerance = (15 * MAX_BPS) / 100;
+        // Allow additional 10 bps in any direction (153, 173) by default
+        rebalanceTolerance = 1000;
 
-        // Minimum collaterization ratio on YFI-A is 175%
-        // Use 225% as target
-        collateralizationRatio = (225 * MAX_BPS) / 100;
+        // Use 30 bps more than the max collateral ratio as target. In case the max is 75%, which is 133 collateral ratio,
+        // we will move between 153 and 173, with a target of 163, which is 61%.
+        collateralizationRatio = maxCollaterizationRate.add(rebalanceTolerance*3);
 
-        // If we lose money in yvDAI then we are not OK selling want to repay it
+        // If we lose money in yvMIM then we are not OK selling want to repay it
         leaveDebtBehind = true;
 
         // Define maximum acceptable loss on withdrawal to be 0.01%.
@@ -183,69 +282,60 @@ contract Strategy is BaseStrategy {
 
         // Set max acceptable base fee to take on more debt to 60 gwei
         maxAcceptableBaseFee = 60 * 1e9;
+
+        // We need to approve the abracadabra master contract to operate
+        bentoBox.setMasterContractApproval(
+            address(this),
+            abracadabra.masterContract(),
+            true,
+            0,
+            0,
+            0
+        );
+
+        /* want.safeApprove(address(bentoBox), type(uint256).max); */
+        /* investmentToken.safeApprove(address(bentoBox), type(uint256).max); */
+        /* dai.safeApprove(address(uniswapRouter), type(uint256).max); */
+        /* investmentToken.safeApprove(address(crvMIM), type(uint256).max); */
+        investmentToken.safeApprove(address(yVault), type(uint256).max);
+        IERC20(wantAsVault.token()).safeApprove(address(want), type(uint256).max);
+        IERC20(wantAsVault).safeApprove(address(wantAsVault), type(uint256).max);
+        require(address(want) == abracadabra.collateral());
     }
 
     // ----------------- SETTERS & MIGRATION -----------------
 
-    // Maximum acceptable base fee of current block to take on more debt
-    function setMaxAcceptableBaseFee(uint256 _maxAcceptableBaseFee)
-        external
-        onlyEmergencyAuthorized
-    {
-        maxAcceptableBaseFee = _maxAcceptableBaseFee;
+    function updateStrategyParams(
+        uint256 _maxAcceptableBaseFee,
+        uint256 _collateralizationRatio,
+        uint256 _rebalanceTolerance,
+        bool _leaveDebtBehind,
+        uint256 _maxLoss,
+        bool isUniswap
+        ) external
+        onlyVaultManagers {
+
+            maxAcceptableBaseFee = _maxAcceptableBaseFee;
+            require(
+                _collateralizationRatio.sub(_rebalanceTolerance) > maxCollaterizationRate
+            ); // dev: desired collateralization ratio is too low or desired rebalance tolerance makes allowed ratio too low
+
+            collateralizationRatio = _collateralizationRatio;
+            rebalanceTolerance = _rebalanceTolerance;
+
+            leaveDebtBehind = _leaveDebtBehind;
+
+            require(_maxLoss <= MAX_LOSS_BPS); // dev: invalid value for max loss
+            maxLoss = _maxLoss;
+            if (isUniswap) {
+                router = uniswapRouter;
+            } else {
+                router = sushiswapRouter;
+            }
     }
 
-    // Target collateralization ratio to maintain within bounds
-    function setCollateralizationRatio(uint256 _collateralizationRatio)
-        external
-        onlyEmergencyAuthorized
-    {
-        require(
-            _collateralizationRatio.sub(rebalanceTolerance) >
-                MakerDaiDelegateLib.getLiquidationRatio(ilk).mul(MAX_BPS).div(
-                    RAY
-                )
-        ); // dev: desired collateralization ratio is too low
-        collateralizationRatio = _collateralizationRatio;
-    }
-
-    // Rebalancing bands (collat ratio - tolerance, collat_ratio + tolerance)
-    function setRebalanceTolerance(uint256 _rebalanceTolerance)
-        external
-        onlyEmergencyAuthorized
-    {
-        require(
-            collateralizationRatio.sub(_rebalanceTolerance) >
-                MakerDaiDelegateLib.getLiquidationRatio(ilk).mul(MAX_BPS).div(
-                    RAY
-                )
-        ); // dev: desired rebalance tolerance makes allowed ratio too low
-        rebalanceTolerance = _rebalanceTolerance;
-    }
-
-    // Max slippage to accept when withdrawing from yVault
-    function setMaxLoss(uint256 _maxLoss) external onlyVaultManagers {
-        require(_maxLoss <= MAX_LOSS_BPS); // dev: invalid value for max loss
-        maxLoss = _maxLoss;
-    }
-
-    // If set to true the strategy will never sell want to repay debts
-    function setLeaveDebtBehind(bool _leaveDebtBehind)
-        external
-        onlyEmergencyAuthorized
-    {
-        leaveDebtBehind = _leaveDebtBehind;
-    }
-
-    // Required to move funds to a new cdp and use a different cdpId after migration
-    // Should only be called by governance as it will move funds
-    function shiftToCdp(uint256 newCdpId) external onlyGovernance {
-        MakerDaiDelegateLib.shiftCdp(cdpId, newCdpId);
-        cdpId = newCdpId;
-    }
-
-    // Move yvDAI funds to a new yVault
-    function migrateToNewDaiYVault(IVault newYVault) external onlyGovernance {
+    // Move yvMIM funds to a new yVault
+    /* function migrateToNewMIMYVault(IVault newYVault) external onlyGovernance {
         uint256 balanceOfYVault = yVault.balanceOf(address(this));
         if (balanceOfYVault > 0) {
             yVault.withdraw(balanceOfYVault, address(this), maxLoss);
@@ -254,47 +344,28 @@ contract Strategy is BaseStrategy {
 
         yVault = newYVault;
         _depositInvestmentTokenInYVault();
-    }
+    } */
 
-    // Allow address to manage Maker's CDP
-    function grantCdpManagingRightsToUser(address user, bool allow)
+    // Allow external debt repayment
+    // Allow repayment of an arbitrary amount of MIM in case of an emergency
+    // If `amount` is larger than 0, the function will attempt to just repay using MIM
+    // disregarding straty logic.  This could be helpful if for example yvMIM withdrawals are failing and
+    // we want to do a MIM airdrop and direct debt repayment instead
+    // If `amount` is 0, it will attempt to take currentRatio to target c-ratio
+    // Passing zero in `currentRatio` will repay all debt if possible.
+    function emergencyDebtRepayment(uint256 amount, uint256 currentRatio)
         external
-        onlyGovernance
+        onlyVaultManagers
     {
-        MakerDaiDelegateLib.allowManagingCdp(cdpId, user, allow);
-    }
-
-    // Allow switching between Uniswap and SushiSwap
-    function switchDex(bool isUniswap) external onlyVaultManagers {
-        if (isUniswap) {
-            router = uniswapRouter;
+        // compute new debt
+        abracadabra.accrue();
+        if (amount > 0) {
+            _repayInvestmentTokenDebt(amount);
         } else {
-            router = sushiswapRouter;
+            _repayDebt(currentRatio);
         }
     }
 
-    // Allow external debt repayment
-    // Attempt to take currentRatio to target c-ratio
-    // Passing zero will repay all debt if possible
-    function emergencyDebtRepayment(uint256 currentRatio)
-        external
-        onlyVaultManagers
-    {
-        _repayDebt(currentRatio);
-    }
-
-    // Allow repayment of an arbitrary amount of Dai without having to
-    // grant access to the CDP in case of an emergency
-    // Difference with `emergencyDebtRepayment` function above is that here we
-    // are short-circuiting all strategy logic and repaying Dai at once
-    // This could be helpful if for example yvDAI withdrawals are failing and
-    // we want to do a Dai airdrop and direct debt repayment instead
-    function repayDebtWithDaiBalance(uint256 amount)
-        external
-        onlyVaultManagers
-    {
-        _repayInvestmentTokenDebt(amount);
-    }
 
     // ******** OVERRIDEN METHODS FROM BASE CONTRACT ************
 
@@ -307,12 +378,16 @@ contract Strategy is BaseStrategy {
     }
 
     function estimatedTotalAssets() public view override returns (uint256) {
-        return
-            balanceOfWant()
-                .add(balanceOfMakerVault())
-                .add(_convertInvestmentTokenToWant(balanceOfInvestmentToken()))
-                .add(_convertInvestmentTokenToWant(_valueOfInvestment()))
-                .sub(_convertInvestmentTokenToWant(balanceOfDebt()));
+        uint256 remainingInvestmentToken =
+            _valueOfInvestment()
+                .add(balanceOfInvestmentTokenInBentoBox(false))
+                .add(balanceOfInvestmentToken())
+                .add(balanceOfCollateralInMIM(false))
+                .sub(balanceOfDebt());
+
+        return balanceOfWant()
+            .add(balanceOfWantInBentoBox())
+            .add(_convertInvestmentTokenToWant(remainingInvestmentToken));
     }
 
     function prepareReturn(uint256 _debtOutstanding)
@@ -329,6 +404,9 @@ contract Strategy is BaseStrategy {
         // Claim rewards from yVault
         _takeYVaultProfit();
 
+        // compute new debt so the collateral ratio is updated
+        abracadabra.accrue();
+
         uint256 totalAssetsAfterProfit = estimatedTotalAssets();
 
         _profit = totalAssetsAfterProfit > totalDebt
@@ -336,9 +414,11 @@ contract Strategy is BaseStrategy {
             : 0;
 
         uint256 _amountFreed;
-        (_amountFreed, _loss) = liquidatePosition(
-            _debtOutstanding.add(_profit)
-        );
+        uint256 _toLiquidate = _debtOutstanding.add(_profit);
+        if (_toLiquidate > 0) {
+            (_amountFreed, _loss) = liquidatePosition(_toLiquidate);
+        }
+
         _debtPayment = Math.min(_debtOutstanding, _amountFreed);
 
         if (_loss > _profit) {
@@ -352,25 +432,26 @@ contract Strategy is BaseStrategy {
             // Example:
             // debtOutstanding 100, profit 50, _amountFreed 140, _loss 10
             // _profit should be 40, (50 profit - 10 loss)
-            // loss should end up in be 0
+            // loss should end up in 0
             _profit = _profit.sub(_loss);
             _loss = 0;
         }
     }
 
     function adjustPosition(uint256 _debtOutstanding) internal override {
-        MakerDaiDelegateLib.keepBasicMakerHygiene(ilk);
-
-        // If we have enough want to deposit more into the maker vault, we do it
+        if (emergencyExit) {
+            return;
+        }
+        // If we have enough want to deposit more into the abracadara, we do it
         // Do not skip the rest of the function as it may need to repay or take on more debt
         uint256 wantBalance = balanceOfWant();
         if (wantBalance > _debtOutstanding) {
             uint256 amountToDeposit = wantBalance.sub(_debtOutstanding);
-            _depositToMakerVault(amountToDeposit);
+            _depositToAbracadabra(amountToDeposit);
         }
 
         // Allow the ratio to move a bit in either direction to avoid cycles
-        uint256 currentRatio = getCurrentMakerVaultRatio();
+        uint256 currentRatio = getCurrentCollateralRatio();
         if (currentRatio < collateralizationRatio.sub(rebalanceTolerance)) {
             _repayDebt(currentRatio);
         } else if (
@@ -398,11 +479,8 @@ contract Strategy is BaseStrategy {
         // We only need to free the amount of want not readily available
         uint256 amountToFree = _amountNeeded.sub(balance);
 
-        uint256 price = _getWantTokenPrice();
-        uint256 collateralBalance = balanceOfMakerVault();
-
         // We cannot free more than what we have locked
-        amountToFree = Math.min(amountToFree, collateralBalance);
+        amountToFree = Math.min(amountToFree, balanceOfCollateral(false));
 
         uint256 totalDebt = balanceOfDebt();
 
@@ -411,17 +489,16 @@ contract Strategy is BaseStrategy {
             totalDebt = 1;
         }
 
-        uint256 toFreeIT = amountToFree.mul(price).div(WAD);
-        uint256 collateralIT = collateralBalance.mul(price).div(WAD);
         uint256 newRatio =
-            collateralIT.sub(toFreeIT).mul(MAX_BPS).div(totalDebt);
+            balanceOfCollateralInMIM(true).sub(_convertWantToInvestmentToken(amountToFree)).mul(MAX_BPS).div(totalDebt);
 
         // Attempt to repay necessary debt to restore the target collateralization ratio
         _repayDebt(newRatio);
 
         // Unlock as much collateral as possible while keeping the target ratio
         amountToFree = Math.min(amountToFree, _maxWithdrawal());
-        _freeCollateralAndRepayDai(amountToFree, 0);
+
+        _freeCollateralAndRepayMIM(amountToFree, 0);
 
         // If we still need more want to repay, we may need to unlock some collateral to sell
         if (
@@ -466,11 +543,11 @@ contract Strategy is BaseStrategy {
         returns (bool)
     {
         // Nothing to adjust if there is no collateral locked
-        if (balanceOfMakerVault() == 0) {
+        if (balanceOfCollateral(false) == 0) {
             return false;
         }
 
-        uint256 currentRatio = getCurrentMakerVaultRatio();
+        uint256 currentRatio = getCurrentCollateralRatio();
 
         // If we need to repay debt and are outside the tolerance bands,
         // we do it regardless of the call cost
@@ -478,19 +555,36 @@ contract Strategy is BaseStrategy {
             return true;
         }
 
-        // Mint more DAI if possible
+        // Mint more MIM if possible
         return
             currentRatio > collateralizationRatio.add(rebalanceTolerance) &&
             balanceOfDebt() > 0 &&
             isCurrentBaseFeeAcceptable() &&
-            MakerDaiDelegateLib.isDaiAvailableToMint(ilk);
+            balanceOfAvailableMIMinAbra() > balanceOfCollateralInMIM(false).mul(100).div(MAX_BPS); //10% of the collateral as MIM in Abra
     }
 
     function prepareMigration(address _newStrategy) internal override {
-        // Transfer Maker Vault ownership to the new startegy
-        MakerDaiDelegateLib.transferCdp(cdpId, _newStrategy);
+        // Move yvMIM balance to the new strategy
+        abracadabra.accrue();
+        _repayDebt(0);
+        uint256 collateralToFree = Math.min(balanceOfCollateral(true), _maxWithdrawal());
+        _freeCollateralAndRepayMIM(collateralToFree, 0);
+        if (
+            !leaveDebtBehind &&
+            balanceOfDebt() > 0
+        ) {
+            _sellCollateralToRepayRemainingDebtIfNeeded();
+        }
 
-        // Move yvDAI balance to the new strategy
+        uint256 _balanceOfMIM = balanceOfInvestmentToken();
+
+        if (_balanceOfMIM > 0) {
+            investmentToken.safeTransfer(_newStrategy, _balanceOfMIM);
+        }
+        if (balanceOfInvestmentTokenInBentoBox(false) > 0 || balanceOfWantInBentoBox() > 0) {
+            transferAllBentoBalance(_newStrategy);
+        }
+
         IERC20(yVault).safeTransfer(
             _newStrategy,
             yVault.balanceOf(address(this))
@@ -501,8 +595,9 @@ contract Strategy is BaseStrategy {
         internal
         view
         override
-        returns (address[] memory)
-    {}
+        returns (address[] memory ret)
+    {
+    }
 
     function ethToWant(uint256 _amtInWei)
         public
@@ -515,13 +610,13 @@ contract Strategy is BaseStrategy {
             return _amtInWei;
         }
 
-        uint256 price = uint256(chainlinkWantToETHPriceFeed.latestAnswer());
-        return _amtInWei.mul(WAD).div(price);
+        uint256 price = uint256(chainlinkWantUnderlyingTokenToETHPriceFeed.latestAnswer());
+        //TODO: check if this formula is working properly
+        return _amtInWei.mul(EXCHANGE_RATE_PRECISION).mul(wantAsVault.pricePerShare()).div(price);
     }
 
-    // ----------------- INTERNAL FUNCTIONS SUPPORT -----------------
-
-    function _repayDebt(uint256 currentRatio) internal {
+    // ----------------- PRIVATE FUNCTIONS SUPPORT -----------------
+    function _repayDebt(uint256 currentRatio) private {
         uint256 currentDebt = balanceOfDebt();
 
         // Nothing to repay if we are over the collateralization ratio
@@ -530,75 +625,71 @@ contract Strategy is BaseStrategy {
             return;
         }
 
+
         // ratio = collateral / debt
         // collateral = current_ratio * current_debt
         // collateral amount is invariant here so we want to find new_debt
         // so that new_debt * desired_ratio = current_debt * current_ratio
         // new_debt = current_debt * current_ratio / desired_ratio
         // and the amount to repay is the difference between current_debt and new_debt
+        // amountToRepay = (current_debt - new_debt)
         uint256 newDebt =
             currentDebt.mul(currentRatio).div(collateralizationRatio);
 
-        uint256 amountToRepay;
-
-        // Maker will revert if the outstanding debt is less than a debt floor
-        // called 'dust'. If we are there we need to either pay the debt in full
-        // or leave at least 'dust' balance (10,000 DAI for YFI-A)
-        uint256 debtFloor = MakerDaiDelegateLib.debtFloor(ilk);
-        if (newDebt <= debtFloor) {
-            // If we sold want to repay debt we will have DAI readily available in the strategy
-            // This means we need to count both yvDAI shares and current DAI balance
-            uint256 totalInvestmentAvailableToRepay =
-                _valueOfInvestment().add(balanceOfInvestmentToken());
-
-            if (totalInvestmentAvailableToRepay >= currentDebt) {
-                // Pay the entire debt if we have enough investment token
-                amountToRepay = currentDebt;
-            } else {
-                // Pay just 0.1 cent above debtFloor (best effort without liquidating want)
-                amountToRepay = currentDebt.sub(debtFloor).sub(1e15);
-            }
-        } else {
-            // If we are not near the debt floor then just pay the exact amount
-            // needed to obtain a healthy collateralization ratio
-            amountToRepay = currentDebt.sub(newDebt);
-        }
+        uint256 amountToRepay = currentDebt.sub(newDebt);
 
         uint256 balanceIT = balanceOfInvestmentToken();
+        // If we sold want to repay debt we will have MIM readily available in the strategy
+        // This means we need to count yvMIM shares, current MIM balance and MIM in bentobox
+        uint256 totalInvestmentAvailableToRepay =
+            _valueOfInvestment().add(balanceIT).add(balanceOfInvestmentTokenInBentoBox(false));
+
+        amountToRepay = Math.min(totalInvestmentAvailableToRepay, amountToRepay);
+
         if (amountToRepay > balanceIT) {
             _withdrawFromYVault(amountToRepay.sub(balanceIT));
         }
+
         _repayInvestmentTokenDebt(amountToRepay);
     }
 
-    function _sellCollateralToRepayRemainingDebtIfNeeded() internal {
-        uint256 currentInvestmentValue = _valueOfInvestment();
-
+    function _sellCollateralToRepayRemainingDebtIfNeeded() private {
         uint256 investmentLeftToAcquire =
-            balanceOfDebt().sub(currentInvestmentValue);
+            balanceOfDebt().sub(_valueOfInvestment());
 
         uint256 investmentLeftToAcquireInWant =
             _convertInvestmentTokenToWant(investmentLeftToAcquire);
 
+
         if (investmentLeftToAcquireInWant <= balanceOfWant()) {
             _buyInvestmentTokenWithWant(investmentLeftToAcquire);
             _repayDebt(0);
-            _freeCollateralAndRepayDai(balanceOfMakerVault(), 0);
+            _freeCollateralAndRepayMIM(balanceOfCollateral(true), 0);
         }
     }
 
-    // Mint the maximum DAI possible for the locked collateral
-    function _mintMoreInvestmentToken() internal {
-        uint256 price = _getWantTokenPrice();
-        uint256 amount = balanceOfMakerVault();
+    // Mint the maximum MIM possible for the locked collateral
+    function _mintMoreInvestmentToken() private {
+        uint256 _amountToBorrow =
+            balanceOfCollateralInMIM(false).mul(MAX_BPS).div(collateralizationRatio).sub(balanceOfDebt());
 
-        uint256 daiToMint =
-            amount.mul(price).mul(MAX_BPS).div(collateralizationRatio).div(WAD);
-        daiToMint = daiToMint.sub(balanceOfDebt());
-        _lockCollateralAndMintDai(0, daiToMint);
+        // won't be able to borrow more than available supply
+        _amountToBorrow = Math.min(
+            _amountToBorrow,
+            balanceOfAvailableMIMinAbra()
+        );
+
+        if (_amountToBorrow == 0) return;
+
+        abracadabra.borrow(
+            address(this),
+            bentoBox.toShare(investmentToken, _amountToBorrow, false)
+        );
+
+        removeMIMFromBentoBox();
     }
 
-    function _withdrawFromYVault(uint256 _amountIT) internal returns (uint256) {
+    function _withdrawFromYVault(uint256 _amountIT) private returns (uint256) {
         if (_amountIT == 0) {
             return 0;
         }
@@ -616,7 +707,7 @@ contract Strategy is BaseStrategy {
         return balanceOfInvestmentToken().sub(balancePrior);
     }
 
-    function _depositInvestmentTokenInYVault() internal {
+    function _depositInvestmentTokenInYVault() private {
         uint256 balanceIT = balanceOfInvestmentToken();
         if (balanceIT > 0) {
             _checkAllowance(
@@ -624,44 +715,31 @@ contract Strategy is BaseStrategy {
                 address(investmentToken),
                 balanceIT
             );
-
             yVault.deposit();
         }
     }
 
-    function _repayInvestmentTokenDebt(uint256 amount) internal {
+    function _repayInvestmentTokenDebt(uint256 amount) private {
         if (amount == 0) {
             return;
         }
-
-        uint256 debt = balanceOfDebt();
-        uint256 balanceIT = balanceOfInvestmentToken();
+        // We cannot pay more than we owe
+        amount = Math.min(amount, balanceOfDebt());
 
         // We cannot pay more than loose balance
-        amount = Math.min(amount, balanceIT);
+        amount = Math.min(amount, balanceOfInvestmentToken());
 
-        // We cannot pay more than we owe
-        amount = Math.min(amount, debt);
+
 
         _checkAllowance(
-            MakerDaiDelegateLib.daiJoinAddress(),
+            address(bentoBox),
             address(investmentToken),
             amount
         );
 
         if (amount > 0) {
-            // When repaying the full debt it is very common to experience Vat/dust
-            // reverts due to the debt being non-zero and less than the debt floor.
-            // This can happen due to rounding when _wipeAndFreeGem() divides
-            // the DAI amount by the accumulated stability fee rate.
-            // To circumvent this issue we will add 1 Wei to the amount to be paid
-            // if there is enough investment token balance (DAI) to do it.
-            if (debt.sub(amount) == 0 && balanceIT.sub(amount) >= 1) {
-                amount = amount.add(1);
-            }
-
             // Repay debt amount without unlocking collateral
-            _freeCollateralAndRepayDai(0, amount);
+            _freeCollateralAndRepayMIM(0, amount);
         }
     }
 
@@ -676,7 +754,7 @@ contract Strategy is BaseStrategy {
         }
     }
 
-    function _takeYVaultProfit() internal {
+    function _takeYVaultProfit() private {
         uint256 _debt = balanceOfDebt();
         uint256 _valueInVault = _valueOfInvestment();
         if (_debt >= _valueInVault) {
@@ -684,35 +762,36 @@ contract Strategy is BaseStrategy {
         }
 
         uint256 profit = _valueInVault.sub(_debt);
-        uint256 ySharesToWithdraw = _investmentTokenToYShares(profit);
-        if (ySharesToWithdraw > 0) {
-            yVault.withdraw(ySharesToWithdraw, address(this), maxLoss);
-            _sellAForB(
-                balanceOfInvestmentToken(),
-                address(investmentToken),
-                address(want)
-            );
+        profit = _withdrawFromYVault(profit);
+
+        if (profit > 0) {
+            _sellInvestmentTokenForWant(balanceOfInvestmentToken().mul(sellBuffer).div(MAX_LOSS_BPS));
         }
     }
 
-    function _depositToMakerVault(uint256 amount) internal {
+    function _depositToAbracadabra(uint256 amount) private {
         if (amount == 0) {
             return;
         }
+        _checkAllowance(address(bentoBox), address(want), amount);
 
-        _checkAllowance(gemJoinAdapter, address(want), amount);
-
-        uint256 price = _getWantTokenPrice();
-        uint256 daiToMint =
-            amount.mul(price).mul(MAX_BPS).div(collateralizationRatio).div(WAD);
-
-        _lockCollateralAndMintDai(amount, daiToMint);
+        // first, we need to deposit collateral in bentoBox
+        (, uint256 sharesOut) =
+                bentoBox.deposit(
+                    want,
+                    address(this),
+                    address(this),
+                    amount,
+                    0
+                );
+        // second, we need to add the collateral to abracadabra
+        abracadabra.addCollateral(address(this), false, sharesOut);
     }
 
     // Returns maximum collateral to withdraw while maintaining the target collateralization ratio
-    function _maxWithdrawal() internal view returns (uint256) {
+    function _maxWithdrawal() private view returns (uint256) {
         // Denominated in want
-        uint256 totalCollateral = balanceOfMakerVault();
+        uint256 totalCollateral = balanceOfCollateralInMIM(false);
 
         // Denominated in investment token
         uint256 totalDebt = balanceOfDebt();
@@ -722,24 +801,22 @@ contract Strategy is BaseStrategy {
             return totalCollateral;
         }
 
-        uint256 price = _getWantTokenPrice();
-
         // Min collateral in want that needs to be locked with the outstanding debt
         // Allow going to the lower rebalancing band
         uint256 minCollateral =
-            collateralizationRatio
-                .sub(rebalanceTolerance)
-                .mul(totalDebt)
-                .mul(WAD)
-                .div(price)
-                .div(MAX_BPS);
+        /* _convertInvestmentTokenToWant( */
+                collateralizationRatio
+                    .sub(rebalanceTolerance)
+                    .mul(totalDebt)
+                    .div(MAX_BPS);
+
 
         // If we are under collateralized then it is not safe for us to withdraw anything
         if (minCollateral > totalCollateral) {
             return 0;
         }
 
-        return totalCollateral.sub(minCollateral);
+        return _convertInvestmentTokenToWant(totalCollateral.sub(minCollateral));
     }
 
     // ----------------- PUBLIC BALANCES AND CALCS -----------------
@@ -752,28 +829,48 @@ contract Strategy is BaseStrategy {
         return investmentToken.balanceOf(address(this));
     }
 
-    function balanceOfDebt() public view returns (uint256) {
-        return MakerDaiDelegateLib.debtForCdp(cdpId, ilk);
+    function balanceOfInvestmentTokenInBentoBox(bool roundUp) internal view returns (uint256) {
+        return bentoBox.toAmount(investmentToken, bentoBox.balanceOf(investmentToken, address(this)), roundUp);
     }
 
-    // Returns collateral balance in the vault
-    function balanceOfMakerVault() public view returns (uint256) {
-        return MakerDaiDelegateLib.balanceOfCdp(cdpId, ilk);
+    function balanceOfWantInBentoBox() internal view returns (uint256) {
+        return bentoBox.toAmount(want, bentoBox.balanceOf(want, address(this)), false);
     }
 
-    // Effective collateralization ratio of the vault
-    function getCurrentMakerVaultRatio() public view returns (uint256) {
-        return
-            MakerDaiDelegateLib.getPessimisticRatioOfCdpWithExternalPrice(
-                cdpId,
-                ilk,
-                _getWantTokenPrice(),
-                MAX_BPS
-            );
+    function balanceOfDebt() public view returns (uint256 _borrowedAmount) {
+        Rebase memory _totalBorrow = abracadabra.totalBorrow();
+        _borrowedAmount = RebaseLibrary.toElastic(_totalBorrow, abracadabra.userBorrowPart(address(this)), true);
+    }
+
+    // Returns collateral balance in the abracadabra in Want
+    function balanceOfCollateral(bool roundUp) public view returns (uint256 _collateralAmount) {
+        _collateralAmount = bentoBox.toAmount(
+            want,
+            abracadabra.userCollateralShare(address(this)),
+            roundUp
+        );
+    }
+
+    // Returns collateral balance in the abracadabra in MIM
+    function balanceOfCollateralInMIM(bool roundUp) public view returns (uint256 _collateralAmount) {
+        _collateralAmount = _convertWantToInvestmentToken(balanceOfCollateral(roundUp));
+    }
+
+    function balanceOfAvailableMIMinAbra() internal view returns (uint256 _availableMIM) {
+        _availableMIM = bentoBox.toAmount(investmentToken, bentoBox.balanceOf(investmentToken, address(abracadabra)), false);
+    }
+
+    // Effective collateralization ratio of the strat
+    function getCurrentCollateralRatio() public view returns (uint256 _collateralRate) {
+        if(balanceOfCollateral(false) == 0) return 0;// TODO: remove this line
+        if (balanceOfDebt() == 0) return maxCollaterizationRate.add(rebalanceTolerance*5);//dev: this should represent infinity in this case
+        _collateralRate = balanceOfCollateralInMIM(false).mul(MAX_BPS).div(
+            balanceOfDebt()
+        );
     }
 
     // Check if current block's base fee is under max allowed base fee
-    function isCurrentBaseFeeAcceptable() public view returns (bool) {
+    function isCurrentBaseFeeAcceptable() internal view returns (bool) {
         uint256 baseFee;
         try baseFeeProvider.basefee_global() returns (uint256 currentBaseFee) {
             baseFee = currentBaseFee;
@@ -790,45 +887,6 @@ contract Strategy is BaseStrategy {
 
     // ----------------- INTERNAL CALCS -----------------
 
-    // Returns the minimum price available
-    function _getWantTokenPrice() internal view returns (uint256) {
-        // Use price from spotter as base
-        uint256 minPrice = MakerDaiDelegateLib.getSpotPrice(ilk);
-
-        // Peek the OSM to get current price
-        try wantToUSDOSMProxy.read() returns (
-            uint256 current,
-            bool currentIsValid
-        ) {
-            if (currentIsValid && current > 0) {
-                minPrice = Math.min(minPrice, current);
-            }
-        } catch {
-            // Ignore price peek()'d from OSM. Maybe we are no longer authorized.
-        }
-
-        // Peep the OSM to get future price
-        try wantToUSDOSMProxy.foresight() returns (
-            uint256 future,
-            bool futureIsValid
-        ) {
-            if (futureIsValid && future > 0) {
-                minPrice = Math.min(minPrice, future);
-            }
-        } catch {
-            // Ignore price peep()'d from OSM. Maybe we are no longer authorized.
-        }
-
-        // If price is set to 0 then we hope no liquidations are taking place
-        // Emergency scenarios can be handled via manual debt repayment or by
-        // granting governance access to the CDP
-        require(minPrice > 0); // dev: invalid spot price
-
-        // par is crucial to this calculation as it defines the relationship between DAI and
-        // 1 unit of value in the price
-        return minPrice.mul(RAY).div(MakerDaiDelegateLib.getDaiPar());
-    }
-
     function _valueOfInvestment() internal view returns (uint256) {
         return
             yVault.balanceOf(address(this)).mul(yVault.pricePerShare()).div(
@@ -844,40 +902,85 @@ contract Strategy is BaseStrategy {
         return amount.mul(10**yVault.decimals()).div(yVault.pricePerShare());
     }
 
-    function _lockCollateralAndMintDai(
+    function _freeCollateralAndRepayMIM(
         uint256 collateralAmount,
-        uint256 daiToMint
+        uint256 mimToRepay
     ) internal {
-        MakerDaiDelegateLib.lockGemAndDraw(
-            gemJoinAdapter,
-            cdpId,
-            collateralAmount,
-            daiToMint,
-            balanceOfDebt()
-        );
-    }
+        Rebase memory _totalBorrow = abracadabra.totalBorrow();
 
-    function _freeCollateralAndRepayDai(
-        uint256 collateralAmount,
-        uint256 daiToRepay
-    ) internal {
-        MakerDaiDelegateLib.wipeAndFreeGem(
-            gemJoinAdapter,
-            cdpId,
-            collateralAmount,
-            daiToRepay
-        );
+        if(mimToRepay > 0) {
+
+            uint256 ITinBentoBox = balanceOfInvestmentTokenInBentoBox(false);
+            uint256 _amountToDepositInBB = mimToRepay > ITinBentoBox? mimToRepay.sub(ITinBentoBox):0;
+
+            _amountToDepositInBB = Math.min(_amountToDepositInBB, balanceOfInvestmentToken());
+
+            if (_amountToDepositInBB > 0) {
+                bentoBox.deposit(
+                    investmentToken,
+                    address(this),
+                    address(this),
+                    _amountToDepositInBB,
+                    0
+                );
+            }
+
+
+            //repay receives a part, so we need to calculate the part to repay
+            uint256 part =
+                RebaseLibrary.toBase(
+                    _totalBorrow,
+                    balanceOfInvestmentTokenInBentoBox(false),
+                    false
+                );
+
+            // cannot pay more than is owed
+            part = Math.min(part, abracadabra.userBorrowPart(address(this)));
+            abracadabra.repay(
+                address(this),
+                false,
+                part
+            );
+        }
+        // we need to withdraw enough to keep our c-rate
+        if (collateralAmount > 0) {
+            // we cannot remove more collateral than max withdrawal
+            abracadabra.removeCollateral(
+                address(this),
+                bentoBox.toShare(
+                    want,
+                    Math.min(collateralAmount, _maxWithdrawal()),
+                    false));
+
+            removeCollateralFromBentoBox();
+        }
+
     }
 
     // ----------------- TOKEN CONVERSIONS -----------------
 
+    //MIM to Want
     function _convertInvestmentTokenToWant(uint256 amount)
-        internal
+        private
         view
         returns (uint256)
     {
-        return amount.mul(WAD).div(_getWantTokenPrice());
+        return amount.mul(abracadabra.exchangeRate()).div(
+                EXCHANGE_RATE_PRECISION
+            );
     }
+
+    //Want to MIM
+    function _convertWantToInvestmentToken(uint256 amount)
+        private
+        view
+        returns (uint256)
+    {
+        return amount.mul(
+                EXCHANGE_RATE_PRECISION
+            ).div(abracadabra.exchangeRate());
+    }
+
 
     function _getTokenOutPath(address _token_in, address _token_out)
         internal
@@ -916,18 +1019,100 @@ contract Strategy is BaseStrategy {
         );
     }
 
+    function _exchangeUsingCrvMIM(
+        uint256 _amount,
+        int128 tokenA,
+        int128 tokenB
+    ) internal {
+        if (_amount == 0 || tokenA == tokenB) {
+            return;
+        }
+
+        crvMIM.exchange_underlying(
+            int128(tokenA),
+            int128(tokenB),
+            _amount,
+            _amount.mul(MAX_BPS-sellBuffer).div(MAX_BPS)
+        );
+
+    }
+
     function _buyInvestmentTokenWithWant(uint256 _amount) internal {
         if (_amount == 0 || address(investmentToken) == address(want)) {
             return;
         }
 
-        _checkAllowance(address(router), address(want), _amount);
-        router.swapTokensForExactTokens(
-            _amount,
-            type(uint256).max,
-            _getTokenOutPath(address(want), address(investmentToken)),
+        // cannot withdraw more than we have
+        _amount = Math.min(_convertInvestmentTokenToWant(_amount), balanceOfWant());
+
+        //1. unwrap from vault
+        _checkAllowance(address(wantAsVault), address(wantAsVault), _amount);
+        uint256 collateral = wantAsVault.withdraw(_amount, address(this), maxLoss);
+
+        //2. underlying token -> dai
+        _sellAForB(collateral, wantAsVault.token(), address(dai));
+
+        //3. dai -> crvMIM -> mim
+        _checkAllowance(address(crvMIM), address(dai), dai.balanceOf(address(this)));
+        _exchangeUsingCrvMIM(dai.balanceOf(address(this)), int128(1), int128(0));
+    }
+
+    function _sellInvestmentTokenForWant(uint256 _amount) internal {
+        if (_amount == 0 || address(investmentToken) == address(want)) {
+            return;
+        }
+
+        // 1. exchange investment token (mim) for dai using crvMIM pool
+        _checkAllowance(address(crvMIM), address(investmentToken), _amount);
+
+        _exchangeUsingCrvMIM(_amount, int128(0), int128(1));
+
+        // 2. sell DAI for wantAsVault token
+        _sellAForB(
+            dai.balanceOf(address(this)),
+            address(dai),
+            address(wantAsVault.token())
+        );
+
+        // 3. deposit the token into the wantAsVault
+        wantAsVault.deposit();
+    }
+
+
+    /*********************** Other Functions ***********************/
+
+    function removeMIMFromBentoBox() private {
+        bentoBox.withdraw(
+            investmentToken,
             address(this),
-            now
+            address(this),
+            balanceOfInvestmentTokenInBentoBox(false),
+            0
+        );
+    }
+
+    function removeCollateralFromBentoBox() private {
+        bentoBox.withdraw(
+            want,
+            address(this),
+            address(this),
+            balanceOfWantInBentoBox(),
+            0
+        );
+    }
+
+    function transferAllBentoBalance(address newDestination) private {
+        bentoBox.transfer(
+            investmentToken,
+            address(this),
+            newDestination,
+            balanceOfInvestmentTokenInBentoBox(false)
+        );
+        bentoBox.transfer(
+            want,
+            address(this),
+            newDestination,
+            balanceOfWantInBentoBox()
         );
     }
 }

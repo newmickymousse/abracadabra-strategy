@@ -4,7 +4,7 @@ pragma experimental ABIEncoderV2;
 
 import "./Strategy.sol";
 
-contract MakerDaiDelegateCloner {
+contract MIMMinterFactory {
     address public immutable original;
 
     event Cloned(address indexed clone);
@@ -12,49 +12,48 @@ contract MakerDaiDelegateCloner {
 
     constructor(
         address _vault,
-        address _yVault,
+        address _delegatedVault,
         string memory _strategyName,
-        bytes32 _ilk,
-        address _gemJoin,
-        address _wantToUSDOSMProxy,
-        address _chainlinkWantToETHPriceFeed
+        address _abracadabra,
+        address _chainlinkWantUnderlyingTokenToETHPriceFeed
     ) public {
         Strategy _original =
             new Strategy(
                 _vault,
-                _yVault,
+                _delegatedVault,
                 _strategyName,
-                _ilk,
-                _gemJoin,
-                _wantToUSDOSMProxy,
-                _chainlinkWantToETHPriceFeed
+                _abracadabra,
+                _chainlinkWantUnderlyingTokenToETHPriceFeed
             );
         emit Deployed(address(_original));
 
         original = address(_original);
-
-        Strategy(_original).setRewards(
-            0xc491599b9A20c3A2F0A85697Ee6D9434EFa9f503
-        );
-        Strategy(_original).setKeeper(
-            0x736D7e3c5a6CB2CE3B764300140ABF476F6CFCCF
-        );
-        Strategy(_original).setStrategist(
-            0x16388463d60FFE0661Cf7F1f31a7D658aC790ff7
-        );
+        _original.setRewards(msg.sender);
+        _original.setKeeper(msg.sender);
+        _original.setStrategist(msg.sender);
     }
 
-    function cloneMakerDaiDelegate(
+    function name() external view returns (string memory) {
+        return
+            string(
+                abi.encodePacked(
+                    "Factory",
+                    Strategy(payable(original)).name(),
+                    "@",
+                    Strategy(payable(original)).apiVersion()
+                )
+            );
+    }
+
+    function cloneMIMMinter(
         address _vault,
         address _strategist,
         address _rewards,
         address _keeper,
-        address _yVault,
+        address _delegatedVault,
         string memory _strategyName,
-        bytes32 _ilk,
-        address _gemJoin,
-        address _wantToUSDOSMProxy,
-        address _chainlinkWantToETHPriceFeed
+        address _abracadabra,
+        address _chainlinkWantUnderlyingTokenToETHPriceFeed
     ) external returns (address newStrategy) {
         // Copied from https://github.com/optionality/clone-factory/blob/master/contracts/CloneFactory.sol
         bytes20 addressBytes = bytes20(original);
@@ -75,21 +74,15 @@ contract MakerDaiDelegateCloner {
 
         Strategy(newStrategy).initialize(
             _vault,
-            _yVault,
+            _strategist,
+            _rewards,
+            _keeper,
+            _delegatedVault,
             _strategyName,
-            _ilk,
-            _gemJoin,
-            _wantToUSDOSMProxy,
-            _chainlinkWantToETHPriceFeed
+            _abracadabra,
+            _chainlinkWantUnderlyingTokenToETHPriceFeed
         );
-        Strategy(newStrategy).setKeeper(_keeper);
-        Strategy(newStrategy).setRewards(_rewards);
-        Strategy(newStrategy).setStrategist(_strategist);
 
         emit Cloned(newStrategy);
-    }
-
-    function name() external pure returns (string memory) {
-        return "Yearn-MakerDaiDelegateCloner@0.4.3";
     }
 }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0
+/* // SPDX-License-Identifier: AGPL-3.0
 pragma solidity 0.6.12;
 pragma experimental ABIEncoderV2;
 
@@ -12,20 +12,16 @@ contract TestStrategy is Strategy {
         address _vault,
         address _yVault,
         string memory _strategyName,
-        bytes32 _ilk,
-        address _gemJoin,
-        address _wantToUSDOSMProxy,
-        address _chainlinkWantToETHPriceFeed
+        address _abracadabra,
+        address _chainlinkWantUnderlyingTokenToETHPriceFeed
     )
         public
         Strategy(
             _vault,
             _yVault,
             _strategyName,
-            _ilk,
-            _gemJoin,
-            _wantToUSDOSMProxy,
-            _chainlinkWantToETHPriceFeed
+            _abracadabra,
+            _chainlinkWantUnderlyingTokenToETHPriceFeed
         )
     {}
 
@@ -36,19 +32,8 @@ contract TestStrategy is Strategy {
         (_liquidatedAmount, _loss) = liquidatePosition(_amountNeeded);
     }
 
-    function _getPrice() public view returns (uint256) {
-        return _getWantTokenPrice();
-    }
-
-    function _getCurrentMakerVaultRatio() public view returns (uint256) {
-        return getCurrentMakerVaultRatio();
-    }
-
     function freeCollateral(uint256 collateralAmount) public {
-        return _freeCollateralAndRepayDai(collateralAmount, 0);
+        return _freeCollateralAndRepayMIM(collateralAmount, 0);
     }
 
-    function setCustomOSM(IOSMedianizer _wantToUSDOSMProxy) public {
-        wantToUSDOSMProxy = _wantToUSDOSMProxy;
-    }
-}
+} */

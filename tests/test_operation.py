@@ -1,6 +1,6 @@
 import pytest
 
-from brownie import reverts
+from brownie import reverts, Contract
 
 
 def test_operation(chain, token, vault, strategy, user, amount, gov, RELATIVE_APPROX):
@@ -13,17 +13,15 @@ def test_operation(chain, token, vault, strategy, user, amount, gov, RELATIVE_AP
     # harvest
     chain.sleep(1)
     strategy.harvest({"from": gov})
-    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
+    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount*(1-1/strategy.collateralizationRatio()*0.05)
 
     # tend()
     strategy.tend({"from": gov})
-
     # withdrawal
-    vault.withdraw({"from": user})
-    assert (
-        pytest.approx(token.balanceOf(user), rel=RELATIVE_APPROX) == user_balance_before
-    )
+    vault.withdraw(vault.balanceOf(user), user, 10, {"from": user})#0.1% loss
 
+    assert token.balanceOf(user) < user_balance_before
+    assert token.balanceOf(user) > user_balance_before * 0.99
 
 def test_emergency_exit(
     chain, token, vault, strategy, user, amount, gov, RELATIVE_APPROX
@@ -33,12 +31,15 @@ def test_emergency_exit(
     vault.deposit(amount, {"from": user})
     chain.sleep(1)
     strategy.harvest({"from": gov})
-    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
+    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount*(1-1/strategy.collateralizationRatio()*0.05)
 
     # set emergency and exit
     strategy.setEmergencyExit({"from": gov})
     chain.sleep(1)
+
+    strategy.setDoHealthCheck(False, {"from": gov}) # has losses for the borrow fee
     strategy.harvest({"from": gov})
+
     assert strategy.estimatedTotalAssets() < amount
 
 
@@ -46,15 +47,16 @@ def test_profitable_harvest(
     chain,
     token,
     vault,
-    yvDAI,
-    dai,
-    dai_whale,
+    mim,
+    mim_whale,
+    new_mim_yvault,
     strategy,
     user,
     amount,
     gov,
     RELATIVE_APPROX,
 ):
+
     # Deposit to the vault
     token.approve(vault.address, amount, {"from": user})
     vault.deposit(amount, {"from": user})
@@ -63,20 +65,19 @@ def test_profitable_harvest(
     # Harvest 1: Send funds through the strategy
     chain.sleep(1)
     strategy.harvest({"from": gov})
-    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
+    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount*(1-1/strategy.collateralizationRatio()*0.05)
 
-    # Sleep for 60 days
-    chain.sleep(60 * 24 * 3600)
+    chain.sleep(3600)
     chain.mine(1)
 
     # Simulate profit in yVault
     before_pps = vault.pricePerShare()
-    dai.transfer(yvDAI, yvDAI.totalAssets() * 0.02, {"from": dai_whale})
+    mim.transfer(new_mim_yvault, new_mim_yvault.totalAssets() * 0.01, {"from": mim_whale})
 
     # Harvest 2: Realize profit
     strategy.harvest({"from": gov})
 
-    chain.sleep(3600 * 6)  # 6 hrs needed for profits to unlock
+    chain.sleep(3600)
     chain.mine(1)
     profit = token.balanceOf(vault.address)  # Profits go to vault
 
@@ -94,21 +95,21 @@ def test_change_debt(chain, gov, token, vault, strategy, user, amount, RELATIVE_
     strategy.harvest({"from": gov})
     half = int(amount / 2)
 
-    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == half
+    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == half*(1-1/strategy.collateralizationRatio()*0.05)
 
     vault.updateStrategyDebtRatio(strategy.address, 10_000, {"from": gov})
     chain.sleep(1)
     strategy.harvest({"from": gov})
-    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
+    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount*(1-1/strategy.collateralizationRatio()*0.05)
 
     vault.updateStrategyDebtRatio(strategy.address, 5_000, {"from": gov})
     chain.sleep(1)
     strategy.harvest({"from": gov})
-    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == half
+    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == half*(1-1/strategy.collateralizationRatio()*0.05)
 
 
 def test_sweep(
-    gov, vault, strategy, token, user, amount, weth, weth_amount, yvDAI, dai
+    gov, vault, strategy, token, user, amount
 ):
     # Strategy want token doesn't work
     token.transfer(strategy, amount, {"from": user})

@@ -15,6 +15,7 @@ def test_revoke_strategy_from_vault(
 
     vault.revokeStrategy(strategy.address, {"from": gov})
     chain.sleep(1)
+    strategy.setDoHealthCheck(False, {"from": gov})
     strategy.harvest({"from": gov})
     assert vault.strategies(strategy).dict()["debtRatio"] == 0
     assert vault.strategies(strategy).dict()["totalDebt"] == 0
@@ -33,6 +34,7 @@ def test_revoke_strategy_from_strategy(
 
     strategy.setEmergencyExit({"from": gov})
     chain.sleep(1)
+    strategy.setDoHealthCheck(False, {"from": gov})
     strategy.harvest({"from": gov})
     assert vault.strategies(strategy).dict()["debtRatio"] == 0
     assert vault.strategies(strategy).dict()["totalDebt"] == 0
@@ -49,10 +51,11 @@ def test_revoke_with_profit(
 
     # Send some profit to yvault
     borrow_token.transfer(
-        yvault, 20_000 * (10 ** borrow_token.decimals()), {"from": borrow_whale}
+        yvault, yvault.totalAssets() * 0.01, {"from": borrow_whale}
     )
     vault.revokeStrategy(strategy, {"from": gov})
     chain.sleep(1)
+
     strategy.harvest({"from": gov})
 
     assert vault.strategies(strategy).dict()["totalGain"] > 0
